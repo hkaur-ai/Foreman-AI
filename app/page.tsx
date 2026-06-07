@@ -1009,7 +1009,7 @@ export default function ForemanDashboard() {
 
                 {/* 6. ROR Speed */}
                 <div className="bg-[#111418] border border-[#1e293b] p-2.5 rounded-sm flex flex-col justify-between" id="tile-ror">
-                  <span className="text-[9px] uppercase text-slate-500 leading-none tracking-wider">ror_temp_rate</span>
+                  <span className="text-[9px] uppercase text-slate-500 leading-none tracking-wider">ror_c_per_min</span>
                   <div className="mt-2.5 flex items-baseline justify-between">
                     <span className="font-mono text-base font-extrabold text-amber-500 tracking-tight">
                       {reading ? reading.ror_c_per_min.toFixed(1) : "--"}
@@ -1085,7 +1085,7 @@ export default function ForemanDashboard() {
                       <LineChart data={history} margin={{ top: 5, right: 5, left: -25, bottom: 5 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
-                        <YAxis stroke="#475569" fontSize={9} domain={[120, 250]} />
+                        <YAxis stroke="#475569" fontSize={9} domain={[120, 280]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
                         <Line type="monotone" dataKey="drum_temp_c" stroke="#ef4444" strokeWidth={2} dot={false} />
                       </LineChart>
@@ -1133,7 +1133,7 @@ export default function ForemanDashboard() {
                       <LineChart data={history} margin={{ top: 5, right: 5, left: -25, bottom: 5 }}>
                         <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
-                        <YAxis stroke="#475569" fontSize={9} domain={[-30, 25]} />
+                        <YAxis stroke="#475569" fontSize={9} domain={[-30, 35]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
                         <Line type="monotone" dataKey="ror_c_per_min" stroke="#f59e0b" strokeWidth={2.5} dot={false} />
                       </LineChart>
