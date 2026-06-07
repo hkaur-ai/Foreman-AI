@@ -28,11 +28,15 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
-  Tooltip
+  Tooltip,
+  ReferenceArea
 } from 'recharts';
 
 // @ts-ignore
 import { createRoasterSim } from './roasterSim';
+
+// Monotonic counter for client-side message/audit ids (avoids impure Math.random in render).
+let uidSeq = 0;
 
 // Define TS Interfaces for Recipe Parameters and telemetry
 interface RecipeParameters {
@@ -47,11 +51,88 @@ interface RecipeParameters {
   targetRor: number;
 }
 
+type SignalKey = 'bean_temp_c' | 'drum_temp_c' | 'airflow_pct' | 'ror_c_per_min';
+
+interface AnalysisStep {
+  step_number: number;
+  signal: SignalKey;
+  narration: string;
+  highlight_from_s: number;
+  highlight_to_s: number;
+  finding: string;
+}
+
+interface RootCause {
+  cause: string;
+  confidence: number;
+  evidence: string;
+  verification_step: string;
+}
+
+interface FaultBranch {
+  intermediate_cause: string;
+  confidence: number;
+  root_causes: RootCause[];
+}
+
+interface Diagnosis {
+  intro: string;
+  analysis_steps: AnalysisStep[];
+  fault_tree: FaultBranch[];
+  most_likely_root_cause: string;
+  severity: 'low' | 'medium' | 'high' | 'critical';
+  summary: string;
+}
+
+interface FixStep {
+  step_number: number;
+  action: string;
+  type: 'automatable' | 'manual';
+  target_parameter: string;
+  current_value: string;
+  proposed_value: string;
+  expected_effect: string;
+  risk: 'low' | 'medium' | 'high';
+  risk_note: string;
+}
+
+interface FixPlan {
+  objective: string;
+  steps: FixStep[];
+  requires_human_approval: boolean;
+  approval_summary: string;
+  rollback_plan: string;
+}
+
+interface AuditEntry {
+  id: string;
+  timestamp: string;
+  operator: string;
+  approval_summary: string;
+  decision: 'APPROVED' | 'REJECTED';
+  outcome: string;
+}
+
+type ChatKind =
+  | 'text'
+  | 'analyzing'
+  | 'intro'
+  | 'step'
+  | 'fault_tree'
+  | 'plan'
+  | 'confirmation'
+  | 'error';
+
 interface ChatMessage {
   id: string;
   sender: 'user' | 'assistant';
   timestamp: string;
-  text: string;
+  kind: ChatKind;
+  text?: string;
+  step?: AnalysisStep;
+  diagnosis?: Diagnosis;
+  plan?: FixPlan;
+  decided?: 'APPROVED' | 'REJECTED';
 }
 
 interface RoasterReading {
@@ -85,11 +166,11 @@ export default function ForemanDashboard() {
   const [tickGlow, setTickGlow] = useState(false);
   const tickTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Suggested questions
+  // Suggested questions (human-initiated investigation triggers)
   const SUGGESTED_QUESTIONS = [
+    "Investigate the current anomaly",
     "Why is ROR rising?",
-    "Is airflow normal?",
-    "Diagnose current state"
+    "What should I do?"
   ];
 
   // Recipe Parameters States
@@ -106,16 +187,34 @@ export default function ForemanDashboard() {
   });
 
   // Chat Feed State
-  const [msgSeqID, setMsgSeqID] = useState(1);
   const [chatInput, setChatInput] = useState('');
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'init-1',
       sender: 'assistant',
       timestamp: '15:23:00',
-      text: "Foreman is monitoring the roast. Ask me anything about the live data or current operational profile."
+      kind: 'text',
+      text: "Foreman is monitoring the roast. After a fault, send an investigation message (e.g. \"investigate the anomaly\") and I will walk you through the evidence."
     }
   ]);
+
+  // Investigation pipeline state
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [pendingPlan, setPendingPlan] = useState<FixPlan | null>(null);
+  const [pendingDiagnosis, setPendingDiagnosis] = useState<Diagnosis | null>(null);
+  const [planMsgId, setPlanMsgId] = useState<string | null>(null);
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectReason, setRejectReason] = useState('');
+  const [auditLog, setAuditLog] = useState<AuditEntry[]>([]);
+
+  // Chart highlight bands keyed by signal (recharts ReferenceArea), plus the
+  // currently narrated signal so the matching chart can glow.
+  const [highlightBands, setHighlightBands] = useState<Record<string, { from: number; to: number }[]>>({});
+  const [activeSignal, setActiveSignal] = useState<SignalKey | null>(null);
+
+  // Latest reading kept in a ref so async pipeline steps read live setpoints
+  // without being captured stale in a closure.
+  const readingRef = useRef<RoasterReading | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -133,6 +232,11 @@ export default function ForemanDashboard() {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [messages]);
+
+  // Keep a ref to the latest reading for async pipeline steps.
+  useEffect(() => {
+    readingRef.current = reading;
+  }, [reading]);
 
   // Clean up interval on unmount
   useEffect(() => {
@@ -284,8 +388,17 @@ export default function ForemanDashboard() {
     setIsRoastRunning(false);
     simRef.current = createRoasterSim();
     setReading(null);
+    readingRef.current = null;
     setHistory([]);
     setTickGlow(false);
+    // Clear any in-flight investigation / highlights / gate.
+    setHighlightBands({});
+    setActiveSignal(null);
+    setPendingPlan(null);
+    setPendingDiagnosis(null);
+    setPlanMsgId(null);
+    setRejecting(false);
+    setIsAnalyzing(false);
   };
 
   // Handle recipe input edits
@@ -296,61 +409,480 @@ export default function ForemanDashboard() {
     setRecipe(prev => ({ ...prev, [key]: value }));
   };
 
-  // Submit User Message
-  const handleSendMessage = (textToSend?: string) => {
-    const rawMsgText = textToSend || chatInput;
-    if (!rawMsgText.trim()) return;
+  // --- Investigation pipeline helpers ---
 
-    const currentMsgIndex = msgSeqID;
-    setMsgSeqID(prev => prev + 2); // reserve odd for user, even for assistant
-
-    const currentTime = new Date().toLocaleTimeString('en-US', {
+  const nowTime = () =>
+    new Date().toLocaleTimeString('en-US', {
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit'
     });
 
-    const userMsg: ChatMessage = {
-      id: `usr-${currentMsgIndex}`,
-      sender: 'user',
-      timestamp: currentTime,
-      text: rawMsgText
-    };
+  const uid = () => `m-${(uidSeq++).toString(36)}`;
 
-    setMessages(prev => [...prev, userMsg]);
-    if (!textToSend) {
-      setChatInput('');
+  const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
+
+  const pushMessage = (msg: Omit<ChatMessage, 'id' | 'timestamp'> & { id?: string }) => {
+    const id = msg.id ?? uid();
+    setMessages(prev => [...prev, { ...msg, id, timestamp: nowTime() }]);
+    return id;
+  };
+
+  // Build the frozen telemetry window from the REAL recent readings.
+  const buildTelemetryWindow = () =>
+    history.slice(-12).map(r => ({
+      elapsed_s: r.elapsed_s,
+      bean_temp_c: r.bean_temp_c,
+      drum_temp_c: r.drum_temp_c,
+      exhaust_temp_c: r.exhaust_temp_c,
+      airflow_pct: r.airflow_pct,
+      burner_pct: r.burner_pct,
+      drum_rpm: r.drum_rpm,
+      ror_c_per_min: r.ror_c_per_min,
+      roast_phase: r.roast_phase
+    }));
+
+  async function callForeman(payload: Record<string, unknown>) {
+    const res = await fetch('/api/foreman', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const json = await res.json();
+    if (!res.ok || json.error) {
+      throw new Error(json.error || `Request failed (${res.status}).`);
+    }
+    return json.data;
+  }
+
+  // Run the gated remediation planner (also used to re-plan after a rejection).
+  async function runPlan(diagnosis: Diagnosis, rejectionReason?: string) {
+    const r = readingRef.current;
+    const setpoints = {
+      burner_pct: r?.burner_pct ?? recipe.burnerSetpoint,
+      airflow_pct: r?.airflow_pct ?? recipe.airflow,
+      drum_rpm: r?.drum_rpm ?? recipe.drumSpeed
+    };
+    try {
+      const plan = (await callForeman({
+        stage: 'plan',
+        diagnosis,
+        setpoints,
+        ...(rejectionReason ? { rejection_reason: rejectionReason } : {})
+      })) as FixPlan;
+
+      const id = pushMessage({ sender: 'assistant', kind: 'plan', plan });
+      setPendingPlan(plan);
+      setPlanMsgId(id);
+    } catch (err) {
+      pushMessage({
+        sender: 'assistant',
+        kind: 'error',
+        text: `Foreman could not produce a remediation plan: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }`
+      });
+    }
+  }
+
+  // Full human-initiated investigation: snapshot -> diagnose (narrated) -> plan.
+  async function runInvestigation(userText: string) {
+    const r = readingRef.current;
+    const telemetry = buildTelemetryWindow();
+
+    if (!r || telemetry.length === 0) {
+      pushMessage({
+        sender: 'assistant',
+        kind: 'error',
+        text: 'No live telemetry yet. Start the roast (Run Roast) so I have data to analyze.'
+      });
+      return;
     }
 
-    // Generate response matching static operator queries
-    setTimeout(() => {
-      let responseText = "Foreman telemetry analyzer: Diagnostic logs indicate nominal operating range. Exhaust, cycle, and throughput metrics align perfectly.";
-      
-      const query = rawMsgText.toLowerCase();
-      if (query.includes('ror') || query.includes('rate of rise') || query.includes('rising')) {
-        responseText = "Roast profile telemetry indicates Rate of Rise (ROR) has stabilised at +11.8°C/min. This curve matches the standard caramelisation progression of the current profile batch size (12kg). No burner reduction required yet.";
-      } else if (query.includes('airflow') || query.includes('air') || query.includes('damper')) {
-        responseText = "Airflow is steady at 55%. Exhaust gas temperature is paired safely with drum index at 204°C. Static differential draft gauge measures a nominal 2.4 mbar; centrifugal dust filter indicates perfect chaff collection throughput.";
-      } else if (query.includes('diagnose') || query.includes('status') || query.includes('fault')) {
-        responseText = "SCADA Diagnostic Diagnostics: [HEATING SYSTEM: NORMAL] [DRUM SYSTEM: NORMAL] [BYPASS DRAFT: NORMAL]. The current roaster thermomechanics align precisely with standard First-Crack thermal transition windows.";
-      }
+    setIsAnalyzing(true);
+    // Clear any stale highlights / pending gate from a previous run.
+    setHighlightBands({});
+    setActiveSignal(null);
+    setPendingPlan(null);
+    setPendingDiagnosis(null);
+    setPlanMsgId(null);
+    setRejecting(false);
 
-      setMessages(prev => [
-        ...prev,
-        {
-          id: `ast-${currentMsgIndex + 1}`,
-          sender: 'assistant',
-          timestamp: new Date().toLocaleTimeString('en-US', {
-            hour12: false,
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
-          }),
-          text: responseText
-        }
-      ]);
-    }, 850);
+    const analyzingId = pushMessage({ sender: 'assistant', kind: 'analyzing' });
+
+    const anomaly =
+      `Operator message: "${userText}". ` +
+      `Current status flagged as ${r.status}. ` +
+      `Latest reading at t=${r.elapsed_s}s: bean_temp_c=${r.bean_temp_c}, drum_temp_c=${r.drum_temp_c}, ` +
+      `exhaust_temp_c=${r.exhaust_temp_c}, airflow_pct=${r.airflow_pct}, burner_pct=${r.burner_pct}, ` +
+      `drum_rpm=${r.drum_rpm}, ror_c_per_min=${r.ror_c_per_min}, roast_phase=${r.roast_phase}.`;
+
+    let diagnosis: Diagnosis;
+    try {
+      diagnosis = (await callForeman({ stage: 'diagnose', anomaly, telemetry })) as Diagnosis;
+    } catch (err) {
+      setMessages(prev => prev.filter(m => m.id !== analyzingId));
+      pushMessage({
+        sender: 'assistant',
+        kind: 'error',
+        text: `Foreman's diagnosis failed: ${
+          err instanceof Error ? err.message : 'unknown error'
+        }. Check the Gemini key in .env.local and try again.`
+      });
+      setIsAnalyzing(false);
+      return;
+    }
+
+    // Remove the "analyzing" placeholder, then narrate.
+    setMessages(prev => prev.filter(m => m.id !== analyzingId));
+    setPendingDiagnosis(diagnosis);
+
+    if (diagnosis.intro) {
+      pushMessage({ sender: 'assistant', kind: 'intro', text: diagnosis.intro });
+      await sleep(500);
+    }
+
+    // Reveal analysis steps one at a time; light up the matching chart per step.
+    const steps = Array.isArray(diagnosis.analysis_steps) ? diagnosis.analysis_steps : [];
+    for (const step of steps) {
+      pushMessage({ sender: 'assistant', kind: 'step', step });
+      if (step.signal) {
+        setActiveSignal(step.signal);
+        setHighlightBands(prev => ({
+          ...prev,
+          [step.signal]: [
+            ...(prev[step.signal] ?? []),
+            { from: step.highlight_from_s, to: step.highlight_to_s }
+          ]
+        }));
+      }
+      await sleep(600);
+    }
+    setActiveSignal(null);
+
+    // Render the fault tree + most-likely root cause + severity.
+    pushMessage({ sender: 'assistant', kind: 'fault_tree', diagnosis });
+    await sleep(400);
+
+    // Call 2 runs immediately after diagnosis.
+    await runPlan(diagnosis);
+    setIsAnalyzing(false);
+  }
+
+  // Submit User Message — any send kicks off the investigation pipeline.
+  const handleSendMessage = (textToSend?: string) => {
+    const rawMsgText = (textToSend || chatInput).trim();
+    if (!rawMsgText) return;
+    if (isAnalyzing) return; // ignore while a pipeline is mid-flight
+
+    pushMessage({ sender: 'user', kind: 'text', text: rawMsgText });
+    if (!textToSend) setChatInput('');
+
+    void runInvestigation(rawMsgText);
+  };
+
+  // --- Approval gate handlers ---
+
+  const handleApprove = () => {
+    if (!pendingPlan) return;
+    const approved = pendingPlan;
+
+    // Only NOW does anything touch the simulator.
+    if (simRef.current) simRef.current.applyFix();
+
+    if (planMsgId) {
+      setMessages(prev =>
+        prev.map(m => (m.id === planMsgId ? { ...m, decided: 'APPROVED' } : m))
+      );
+    }
+
+    pushMessage({
+      sender: 'assistant',
+      kind: 'confirmation',
+      text: `Approved. Applying corrective setpoints now — raising airflow and cutting burner. Telemetry should normalize over the next ticks (status will move to RECOVERING, then RECOVERED). Rollback on standby: ${approved.rollback_plan}`
+    });
+
+    setAuditLog(prev => [
+      ...prev,
+      {
+        id: uid(),
+        timestamp: nowTime(),
+        operator: 'Operator A',
+        approval_summary: approved.approval_summary,
+        decision: 'APPROVED',
+        outcome: 'telemetry recovered'
+      }
+    ]);
+
+    // Bands fade once the fix is authorized.
+    setHighlightBands({});
+    setActiveSignal(null);
+    setPendingPlan(null);
+    setPlanMsgId(null);
+    setRejecting(false);
+  };
+
+  const handleRejectSubmit = async () => {
+    if (!pendingPlan || !pendingDiagnosis) return;
+    const reason = rejectReason.trim() || 'No reason provided.';
+    const rejected = pendingPlan;
+
+    if (planMsgId) {
+      setMessages(prev =>
+        prev.map(m => (m.id === planMsgId ? { ...m, decided: 'REJECTED' } : m))
+      );
+    }
+
+    setAuditLog(prev => [
+      ...prev,
+      {
+        id: uid(),
+        timestamp: nowTime(),
+        operator: 'Operator A',
+        approval_summary: rejected.approval_summary,
+        decision: 'REJECTED',
+        outcome: 're-planned'
+      }
+    ]);
+
+    pushMessage({ sender: 'user', kind: 'text', text: `Reject — ${reason}` });
+
+    setRejecting(false);
+    setRejectReason('');
+    setPendingPlan(null);
+    setPlanMsgId(null);
+
+    // Re-plan with the operator's reason.
+    setIsAnalyzing(true);
+    await runPlan(pendingDiagnosis, reason);
+    setIsAnalyzing(false);
+  };
+
+  // --- Chart highlight rendering ---
+
+  const bandsFor = (signal: SignalKey) =>
+    (highlightBands[signal] ?? []).map((b, i) => (
+      <ReferenceArea
+        key={`${signal}-${i}`}
+        x1={b.from}
+        x2={b.to}
+        fill="#f59e0b"
+        fillOpacity={0.14}
+        stroke="#f59e0b"
+        strokeOpacity={0.35}
+        ifOverflow="extendDomain"
+      />
+    ));
+
+  const cardGlow = (signal: SignalKey) =>
+    activeSignal === signal
+      ? 'border-amber-500 shadow-[0_0_18px_rgba(245,158,11,0.35)]'
+      : 'border-[#1e293b]';
+
+  const confidencePct = (c: number) => `${Math.round(Math.max(0, Math.min(1, c)) * 100)}%`;
+
+  const severityBadge = (sev: Diagnosis['severity']) => {
+    switch (sev) {
+      case 'critical':
+        return 'text-red-400 border-red-500/40 bg-red-950/30';
+      case 'high':
+        return 'text-orange-400 border-orange-500/40 bg-orange-950/30';
+      case 'medium':
+        return 'text-amber-400 border-amber-500/40 bg-amber-950/30';
+      default:
+        return 'text-emerald-400 border-emerald-500/40 bg-emerald-950/30';
+    }
+  };
+
+  const riskColor = (risk: FixStep['risk']) => {
+    switch (risk) {
+      case 'high':
+        return 'text-red-400 border-red-500/40 bg-red-950/30';
+      case 'medium':
+        return 'text-amber-400 border-amber-500/40 bg-amber-950/30';
+      default:
+        return 'text-emerald-400 border-emerald-500/40 bg-emerald-950/30';
+    }
+  };
+
+  const SIGNAL_LABEL: Record<SignalKey, string> = {
+    bean_temp_c: 'bean_temp_c',
+    drum_temp_c: 'drum_temp_c',
+    airflow_pct: 'airflow_pct',
+    ror_c_per_min: 'ror_c_per_min'
+  };
+
+  // --- Rich chat message bodies ---
+
+  const renderStepBody = (step: AnalysisStep) => (
+    <div className="text-xs">
+      <div className="flex items-center space-x-2 mb-1.5">
+        <span className="font-mono text-[9px] font-bold text-[#3b82f6] bg-[rgba(59,130,246,0.12)] border border-[#3b82f6]/30 px-1.5 py-0.5 rounded-sm">
+          STEP {step.step_number}
+        </span>
+        <span className="font-mono text-[9px] text-amber-400 bg-amber-950/30 border border-amber-500/30 px-1.5 py-0.5 rounded-sm">
+          {SIGNAL_LABEL[step.signal] ?? step.signal} · {formatElapsed(step.highlight_from_s)}–{formatElapsed(step.highlight_to_s)}
+        </span>
+      </div>
+      <p className="text-slate-200 leading-relaxed">{step.narration}</p>
+      <p className="mt-1.5 text-[11px] text-emerald-300/90 border-l-2 border-emerald-500/40 pl-2">
+        {step.finding}
+      </p>
+    </div>
+  );
+
+  const renderFaultTreeBody = (d: Diagnosis) => (
+    <div className="text-xs space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-[9px] uppercase font-bold tracking-widest text-slate-400">Fault Tree</span>
+        <span className={`text-[9px] uppercase font-bold tracking-widest px-2 py-0.5 border rounded-sm ${severityBadge(d.severity)}`}>
+          {d.severity}
+        </span>
+      </div>
+
+      <div className="space-y-2.5">
+        {(d.fault_tree ?? []).map((branch, bi) => (
+          <div key={bi} className="border border-[#1e293b] rounded-sm p-2.5 bg-[#0a0c0f]">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-slate-200 font-semibold">{branch.intermediate_cause}</span>
+              <span className="font-mono text-[9px] text-slate-400 ml-2 shrink-0">{confidencePct(branch.confidence)}</span>
+            </div>
+            <div className="h-1 w-full bg-[#1e293b] rounded-sm overflow-hidden mb-2">
+              <div className="h-full bg-[#3b82f6]" style={{ width: confidencePct(branch.confidence) }} />
+            </div>
+            <div className="space-y-2 pl-2 border-l border-[#1e293b]">
+              {(branch.root_causes ?? []).map((rc, ri) => (
+                <div key={ri} className="text-[11px]">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-300 font-medium">{rc.cause}</span>
+                    <span className="font-mono text-[9px] text-slate-500 ml-2 shrink-0">{confidencePct(rc.confidence)}</span>
+                  </div>
+                  <p className="text-slate-500 mt-0.5"><span className="text-slate-400">Evidence:</span> {rc.evidence}</p>
+                  <p className="text-slate-500 mt-0.5"><span className="text-slate-400">Verify:</span> {rc.verification_step}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="border border-amber-500/30 bg-amber-950/20 rounded-sm p-2.5">
+        <span className="text-[9px] uppercase font-bold tracking-widest text-amber-400">Most Likely Root Cause</span>
+        <p className="text-slate-100 mt-1">{d.most_likely_root_cause}</p>
+      </div>
+
+      {d.summary && <p className="text-slate-400 leading-relaxed">{d.summary}</p>}
+    </div>
+  );
+
+  const renderPlanBody = (msg: ChatMessage) => {
+    const plan = msg.plan!;
+    const isActiveGate = pendingPlan !== null && msg.id === planMsgId && !msg.decided;
+    return (
+      <div className="text-xs space-y-3">
+        <div>
+          <span className="text-[9px] uppercase font-bold tracking-widest text-[#3b82f6]">Proposed Fix Plan</span>
+          <p className="text-slate-200 mt-1">{plan.objective}</p>
+        </div>
+
+        <div className="space-y-2">
+          {(plan.steps ?? []).map((s) => (
+            <div key={s.step_number} className="border border-[#1e293b] rounded-sm p-2.5 bg-[#0a0c0f]">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-slate-200 font-semibold">{s.step_number}. {s.action}</span>
+                <div className="flex items-center space-x-1.5 shrink-0 ml-2">
+                  <span className={`font-mono text-[8px] uppercase px-1.5 py-0.5 rounded-sm border ${
+                    s.type === 'automatable'
+                      ? 'text-[#3b82f6] border-[#3b82f6]/40 bg-[rgba(59,130,246,0.1)]'
+                      : 'text-slate-400 border-slate-600/40 bg-slate-800/30'
+                  }`}>{s.type}</span>
+                  <span className={`font-mono text-[8px] uppercase px-1.5 py-0.5 rounded-sm border ${riskColor(s.risk)}`}>
+                    {s.risk} risk
+                  </span>
+                </div>
+              </div>
+              <div className="font-mono text-[10px] text-slate-400">
+                {s.target_parameter}: <span className="text-slate-300">{s.current_value}</span>
+                {' → '}
+                <span className="text-emerald-400">{s.proposed_value}</span>
+              </div>
+              <p className="text-[10px] text-slate-500 mt-1">{s.expected_effect}</p>
+              {s.risk_note && <p className="text-[10px] text-slate-600 mt-0.5 italic">{s.risk_note}</p>}
+            </div>
+          ))}
+        </div>
+
+        <p className="text-[10px] text-slate-500"><span className="text-slate-400">Rollback:</span> {plan.rollback_plan}</p>
+
+        {/* Approval gate */}
+        <div className="border border-amber-500/40 bg-amber-950/20 rounded-sm p-3">
+          <div className="flex items-start space-x-2 mb-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />
+            <p className="text-slate-100 font-medium">{plan.approval_summary}</p>
+          </div>
+
+          {msg.decided ? (
+            <div className={`text-[10px] font-mono uppercase tracking-widest font-bold ${
+              msg.decided === 'APPROVED' ? 'text-emerald-400' : 'text-red-400'
+            }`}>
+              {msg.decided === 'APPROVED' ? '✓ Approved by Operator A' : '✕ Rejected by Operator A'}
+            </div>
+          ) : isActiveGate ? (
+            rejecting ? (
+              <div className="space-y-2">
+                <input
+                  id="reject-reason-input"
+                  type="text"
+                  autoFocus
+                  value={rejectReason}
+                  onChange={(e) => setRejectReason(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') void handleRejectSubmit(); }}
+                  placeholder="One-line reason for rejection…"
+                  className="w-full bg-[#0a0c0f] border border-[#334155] text-slate-200 text-[11px] rounded-sm p-2 outline-none focus:border-red-500"
+                />
+                <div className="flex items-center space-x-2">
+                  <button
+                    id="btn-reject-confirm"
+                    onClick={() => void handleRejectSubmit()}
+                    className="flex-1 py-2 bg-[#ef4444] hover:bg-[#dc2626] text-white text-[10px] uppercase font-bold tracking-widest rounded-sm transition-all cursor-pointer"
+                  >
+                    Submit Rejection
+                  </button>
+                  <button
+                    onClick={() => { setRejecting(false); setRejectReason(''); }}
+                    className="px-3 py-2 border border-slate-700 hover:border-slate-500 text-slate-300 text-[10px] uppercase font-bold tracking-widest rounded-sm transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="flex items-center space-x-2">
+                <button
+                  id="btn-approve-fix"
+                  onClick={handleApprove}
+                  className="flex-1 py-2.5 flex items-center justify-center space-x-1.5 bg-[#10b981] hover:bg-[#059669] text-white text-[10px] uppercase font-bold tracking-widest rounded-sm transition-all cursor-pointer"
+                >
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  <span>Approve</span>
+                </button>
+                <button
+                  id="btn-reject-fix"
+                  onClick={() => setRejecting(true)}
+                  className="flex-1 py-2.5 flex items-center justify-center space-x-1.5 bg-[#ef4444] hover:bg-[#dc2626] text-white text-[10px] uppercase font-bold tracking-widest rounded-sm transition-all cursor-pointer"
+                >
+                  <Square className="w-3 h-3 fill-white" />
+                  <span>Reject</span>
+                </button>
+              </div>
+            )
+          ) : (
+            <div className="text-[10px] font-mono uppercase tracking-widest text-slate-500">Superseded</div>
+          )}
+        </div>
+      </div>
+    );
   };
 
   if (!mounted) {
@@ -1046,7 +1578,7 @@ export default function ForemanDashboard() {
               <div className="flex-1 p-4 grid grid-cols-1 lg:grid-cols-2 gap-4 pb-12" id="scada-charts-2x2">
                 
                 {/* CHART 1: BEAN TEMP */}
-                <div className="bg-[#111418] border border-[#1e293b] rounded-sm p-4 flex flex-col justify-between" id="ch-card-bean-temp">
+                <div className={`bg-[#111418] border rounded-sm p-4 flex flex-col justify-between transition-all duration-300 ${cardGlow('bean_temp_c')}`} id="ch-card-bean-temp">
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center space-x-2">
                       <Thermometer className="w-4 h-4 text-[#3b82f6]" />
@@ -1063,6 +1595,7 @@ export default function ForemanDashboard() {
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
                         <YAxis stroke="#475569" fontSize={9} domain={[100, 240]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
+                        {bandsFor('bean_temp_c')}
                         <Line type="monotone" dataKey="bean_temp_c" stroke="#3b82f6" strokeWidth={2.5} dot={false} activeDot={{ r: 5 }} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -1070,7 +1603,7 @@ export default function ForemanDashboard() {
                 </div>
 
                 {/* CHART 2: DRUM TEMP */}
-                <div className="bg-[#111418] border border-[#1e293b] rounded-sm p-4 flex flex-col justify-between" id="ch-card-drum-temp">
+                <div className={`bg-[#111418] border rounded-sm p-4 flex flex-col justify-between transition-all duration-300 ${cardGlow('drum_temp_c')}`} id="ch-card-drum-temp">
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center space-x-2">
                       <Gauge className="w-4 h-4 text-[#ef4444]" />
@@ -1087,6 +1620,7 @@ export default function ForemanDashboard() {
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
                         <YAxis stroke="#475569" fontSize={9} domain={[120, 280]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
+                        {bandsFor('drum_temp_c')}
                         <Line type="monotone" dataKey="drum_temp_c" stroke="#ef4444" strokeWidth={2} dot={false} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -1094,7 +1628,7 @@ export default function ForemanDashboard() {
                 </div>
 
                 {/* CHART 3: AIRFLOW */}
-                <div className="bg-[#111418] border border-[#1e293b] rounded-sm p-4 flex flex-col justify-between" id="ch-card-airflow">
+                <div className={`bg-[#111418] border rounded-sm p-4 flex flex-col justify-between transition-all duration-300 ${cardGlow('airflow_pct')}`} id="ch-card-airflow">
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center space-x-2">
                       <Wind className="w-4 h-4 text-[#10b981]" />
@@ -1111,6 +1645,7 @@ export default function ForemanDashboard() {
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
                         <YAxis stroke="#475569" fontSize={9} domain={[0, 100]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
+                        {bandsFor('airflow_pct')}
                         <Line type="monotone" dataKey="airflow_pct" stroke="#10b981" strokeWidth={2} dot={false} />
                       </LineChart>
                     </ResponsiveContainer>
@@ -1118,7 +1653,7 @@ export default function ForemanDashboard() {
                 </div>
 
                 {/* CHART 4: ROR (RATE OF RISE) */}
-                <div className="bg-[#111418] border border-[#1e293b] rounded-sm p-4 flex flex-col justify-between" id="ch-card-ror">
+                <div className={`bg-[#111418] border rounded-sm p-4 flex flex-col justify-between transition-all duration-300 ${cardGlow('ror_c_per_min')}`} id="ch-card-ror">
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center space-x-2">
                       <TrendingUp className="w-4 h-4 text-[#f59e0b]" />
@@ -1135,12 +1670,49 @@ export default function ForemanDashboard() {
                         <XAxis dataKey="elapsed_s" stroke="#475569" fontSize={9} tickFormatter={formatElapsed} />
                         <YAxis stroke="#475569" fontSize={9} domain={[-30, 35]} />
                         <Tooltip contentStyle={{ backgroundColor: '#111418', borderColor: '#334155', fontSize: '11px', color: '#fff' }} />
+                        {bandsFor('ror_c_per_min')}
                         <Line type="monotone" dataKey="ror_c_per_min" stroke="#f59e0b" strokeWidth={2.5} dot={false} />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
 
+              </div>
+
+              {/* AUDIT LOG — human approval decisions */}
+              <div className="px-4 pb-6" id="foreman-audit-log">
+                <div className="bg-[#111418] border border-[#1e293b] rounded-sm">
+                  <div className="flex items-center justify-between px-3 py-2 border-b border-[#1e293b]">
+                    <div className="flex items-center space-x-2">
+                      <CheckCircle2 className="w-3.5 h-3.5 text-slate-400" />
+                      <span className="text-[10px] uppercase font-bold tracking-widest text-slate-300">Approval Audit Log</span>
+                    </div>
+                    <span className="font-mono text-[9px] text-slate-500">{auditLog.length} {auditLog.length === 1 ? 'entry' : 'entries'}</span>
+                  </div>
+                  {auditLog.length === 0 ? (
+                    <p className="px-3 py-3 text-[10px] font-mono text-slate-600">
+                      No decisions yet. Approvals and rejections will be recorded here.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-[#1e293b]">
+                      {auditLog.map((entry) => (
+                        <div key={entry.id} className="px-3 py-2 flex items-start space-x-3" id={`audit-${entry.id}`}>
+                          <span className="font-mono text-[9px] text-slate-500 mt-0.5 shrink-0">{entry.timestamp}</span>
+                          <span className="font-mono text-[9px] text-slate-400 mt-0.5 shrink-0">{entry.operator}</span>
+                          <span className={`font-mono text-[8px] uppercase font-bold px-1.5 py-0.5 rounded-sm border shrink-0 ${
+                            entry.decision === 'APPROVED'
+                              ? 'text-emerald-400 border-emerald-500/40 bg-emerald-950/30'
+                              : 'text-red-400 border-red-500/40 bg-red-950/30'
+                          }`}>{entry.decision}</span>
+                          <div className="min-w-0 flex-1">
+                            <p className="text-[10px] text-slate-300 leading-snug">{entry.approval_summary}</p>
+                            <p className="text-[9px] text-slate-500 mt-0.5">→ {entry.outcome}</p>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -1163,34 +1735,58 @@ export default function ForemanDashboard() {
 
               {/* Scrollable Conversation Workspace Thread */}
               <div className="flex-1 overflow-y-auto p-4 space-y-4" id="chat-conversation-container">
-                {messages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    id={`msg-${msg.id}`}
-                    className={`flex flex-col max-w-[90%] whitespace-pre-wrap leading-relaxed ${
-                      msg.sender === 'user' ? 'ml-auto items-end' : 'mr-auto items-start'
-                    }`}
-                  >
-                    {/* Username detail metadata */}
-                    <div className="flex items-center space-x-2 mb-1">
-                      <span className="text-[9px] uppercase font-bold tracking-widest text-slate-500">
-                        {msg.sender === 'user' ? 'Operator' : 'Foreman AI'}
-                      </span>
-                      <span className="text-[8px] font-mono text-slate-600">{msg.timestamp}</span>
-                    </div>
-
-                    {/* Speech box wrapper */}
+                {messages.map((msg) => {
+                  const isRich = msg.kind === 'fault_tree' || msg.kind === 'plan';
+                  return (
                     <div
-                      className={`text-xs p-3 rounded-sm ${
-                        msg.sender === 'user'
-                          ? 'bg-[#1e293b] text-slate-100 border border-[#334155]/50 rounded-tr-none'
-                          : 'bg-[#111418] text-slate-100 border border-[#1e293b] rounded-tl-none'
-                      }`}
+                      key={msg.id}
+                      id={`msg-${msg.id}`}
+                      className={`flex flex-col whitespace-pre-wrap leading-relaxed ${
+                        isRich ? 'max-w-full w-full' : 'max-w-[90%]'
+                      } ${msg.sender === 'user' ? 'ml-auto items-end' : 'mr-auto items-start'}`}
                     >
-                      {msg.text}
+                      {/* Username detail metadata */}
+                      <div className="flex items-center space-x-2 mb-1">
+                        <span className="text-[9px] uppercase font-bold tracking-widest text-slate-500">
+                          {msg.sender === 'user' ? 'Operator' : 'Foreman AI'}
+                        </span>
+                        <span className="text-[8px] font-mono text-slate-600">{msg.timestamp}</span>
+                      </div>
+
+                      {/* Speech box wrapper */}
+                      <div
+                        className={`text-xs p-3 rounded-sm w-full ${
+                          msg.sender === 'user'
+                            ? 'bg-[#1e293b] text-slate-100 border border-[#334155]/50 rounded-tr-none'
+                            : msg.kind === 'error'
+                            ? 'bg-red-950/30 text-red-200 border border-red-900/50 rounded-tl-none'
+                            : msg.kind === 'confirmation'
+                            ? 'bg-emerald-950/20 text-emerald-100 border border-emerald-800/40 rounded-tl-none'
+                            : msg.kind === 'intro'
+                            ? 'bg-[#0d1014] text-slate-100 border border-[#3b82f6]/30 rounded-tl-none'
+                            : 'bg-[#111418] text-slate-100 border border-[#1e293b] rounded-tl-none'
+                        }`}
+                      >
+                        {msg.kind === 'analyzing' ? (
+                          <span className="flex items-center space-x-2 text-slate-400">
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#3b82f6] animate-bounce" style={{ animationDelay: '0ms' }}></span>
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#3b82f6] animate-bounce" style={{ animationDelay: '150ms' }}></span>
+                            <span className="w-1.5 h-1.5 rounded-full bg-[#3b82f6] animate-bounce" style={{ animationDelay: '300ms' }}></span>
+                            <span className="text-[11px] uppercase tracking-wider">Foreman is analyzing…</span>
+                          </span>
+                        ) : msg.kind === 'step' && msg.step ? (
+                          renderStepBody(msg.step)
+                        ) : msg.kind === 'fault_tree' && msg.diagnosis ? (
+                          renderFaultTreeBody(msg.diagnosis)
+                        ) : msg.kind === 'plan' && msg.plan ? (
+                          renderPlanBody(msg)
+                        ) : (
+                          msg.text
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
                 <div ref={messagesEndRef} />
               </div>
 
@@ -1203,8 +1799,11 @@ export default function ForemanDashboard() {
                     <button
                       key={idx}
                       id={`suggested-chip-${idx}`}
+                      disabled={isAnalyzing}
                       onClick={() => handleSendMessage(chip)}
-                      className="text-[10px] font-mono bg-[#111418] hover:bg-[#1e293b] text-slate-400 hover:text-slate-100 border border-[#1e293b] px-2 py-1.5 rounded-sm transition-all text-left truncate max-w-full cursor-pointer"
+                      className={`text-[10px] font-mono bg-[#111418] hover:bg-[#1e293b] text-slate-400 hover:text-slate-100 border border-[#1e293b] px-2 py-1.5 rounded-sm transition-all text-left truncate max-w-full ${
+                        isAnalyzing ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
+                      }`}
                     >
                       <span className="text-[#3b82f6] mr-1">#</span> {chip}
                     </button>
@@ -1224,14 +1823,18 @@ export default function ForemanDashboard() {
                     id="chat-text-input"
                     type="text"
                     value={chatInput}
+                    disabled={isAnalyzing}
                     onChange={(e) => setChatInput(e.target.value)}
-                    placeholder="Ask Foreman about the roast…"
-                    className="flex-1 bg-transparent text-xs text-slate-200 outline-none px-2.5 h-9"
+                    placeholder={isAnalyzing ? 'Foreman is analyzing…' : 'Ask Foreman about the roast…'}
+                    className="flex-1 bg-transparent text-xs text-slate-200 outline-none px-2.5 h-9 disabled:opacity-50"
                   />
                   <button
                     id="chat-btn-send"
                     type="submit"
-                    className="p-2 bg-[#3b82f6] hover:bg-[#2563eb] text-white rounded-sm transition-all shrink-0 cursor-pointer"
+                    disabled={isAnalyzing}
+                    className={`p-2 bg-[#3b82f6] hover:bg-[#2563eb] text-white rounded-sm transition-all shrink-0 ${
+                      isAnalyzing ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'
+                    }`}
                   >
                     <Send className="w-3.5 h-3.5 fill-white stroke-white" />
                   </button>
